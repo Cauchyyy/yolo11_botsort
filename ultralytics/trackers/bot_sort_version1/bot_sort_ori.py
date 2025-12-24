@@ -1,12 +1,8 @@
 # Ultralytics YOLO 🚀, AGPL-3.0 license
 
-import importlib.util
-import math
-from collections import Counter, deque
+from collections import deque
 
 import numpy as np
-from ultralytics.utils import LOGGER
-from ultralytics.utils.ops import xywh2xyxy
 
 from .basetrack import TrackState
 from .byte_tracker import BYTETracker, STrack
@@ -51,7 +47,7 @@ class BOTrack(STrack):
 
     shared_kalman = KalmanFilterXYWH()
 
-    def __init__(self, tlwh, score, cls, feat=None, feat_history=50, reid_conf=None):
+    def __init__(self, tlwh, score, cls, feat=None, feat_history=50):
         """
         Initialize a BOTrack object with temporal parameters, such as feature history, alpha, and current features.
 
@@ -79,18 +75,6 @@ class BOTrack(STrack):
         self.features = deque([], maxlen=feat_history)   # 特征历史队列（限制最大长度，默认50）
         self.alpha = 0.9   # 特征平滑的指数移动平均因子（0.9表示更依赖历史特征）
 
-        self.reid_conf = reid_conf
-        self.cls_history = deque()
-        self.perm_id = None
-        self.id_locked = False
-        self.label_votes = deque(maxlen=15)
-        self.fish_label = -1
-        self.is_temporary = True
-        self.hits = 0
-        # 速度记录，仅用于调试（本版本未在关联中使用）
-        self.prev_center = None
-        self.speed = 0.0
-
     def update_features(self, feat):
         """Update the feature vector and apply exponential moving average smoothing."""
         feat /= np.linalg.norm(feat)
@@ -110,68 +94,18 @@ class BOTrack(STrack):
             mean_state[7] = 0
 
         self.mean, self.covariance = self.kalman_filter.predict(mean_state, self.covariance)
-    ##################################################
-    def activate(self, kalman_filter, frame_id):
-        """Activates a new tracklet and records its initial classification for later voting."""
-        if self.cls is not None:
-            self.cls_history.append(int(self.cls))
-        super().activate(kalman_filter, frame_id)
-        self.hits = 1
-        self._update_speed()
-    ###################################################################
+
     def re_activate(self, new_track, frame_id, new_id=False):
         """Reactivates a track with updated features and optionally assigns a new ID."""
         if new_track.curr_feat is not None:
             self.update_features(new_track.curr_feat)
-        #add
-        if new_track.cls is not None:
-            self.cls_history.append(int(new_track.cls))
-
         super().re_activate(new_track, frame_id, new_id)
-        #add
-        self.hits += 1
-        self._update_speed()
 
     def update(self, new_track, frame_id):
         """Updates the YOLOv8 instance with new track information and the current frame ID."""
         if new_track.curr_feat is not None:
             self.update_features(new_track.curr_feat)
-        ##add
-        if new_track.cls is not None:
-            self.cls_history.append(int(new_track.cls))
         super().update(new_track, frame_id)
-        self.hits += 1
-        self._update_speed()
-
-    def add_label_vote(self, label: int):
-        """Accumulate ReID classifier votes and keep the majority as fish_label."""
-        if label is None:
-            return
-        label = int(label)
-        if label < 0:
-            return
-        self.label_votes.append(label)
-        ctr = Counter(self.label_votes)
-        if len(ctr) > 0:
-            lbl, _ = ctr.most_common(1)[0]
-            self.fish_label = int(lbl)
-
-    def promote_to_permanent(self, perm_id: int):
-        """Mark this track as a permanent track with a fixed perm_id."""
-        self.is_temporary = False
-        self.perm_id = int(perm_id)
-        self.id_locked = True
-
-    def _update_speed(self):
-        """Update per-frame speed estimate based on bbox center displacement."""
-        tlwh = self.tlwh
-        cx = tlwh[0] + tlwh[2] / 2.0
-        cy = tlwh[1] + tlwh[3] / 2.0
-        if self.prev_center is not None:
-            dx = cx - self.prev_center[0]
-            dy = cy - self.prev_center[1]
-            self.speed = math.hypot(dx, dy)
-        self.prev_center = (cx, cy)
 
     @property  #@property 使其可像属性一样访问（track.tlwh）
     def tlwh(self):
@@ -209,23 +143,6 @@ class BOTrack(STrack):
         ret[:2] += ret[2:] / 2
         return ret
 
-    @property
-    def result(self):
-        """返回跟踪结果，优先使用每帧分配好的 display_id，并附带原始 track_id。"""
-        coords = self.xyxy if self.angle is None else self.xywha
-
-        # 优先使用 BOTSORT 在当前帧分配好的 display_id（若存在）
-        display_id = getattr(self, "display_id", None)
-        if display_id is None:
-            # S1-only: no per-fish display assignment; fall back to unique track_id
-            display_id = int(self.track_id)
-        else:
-            display_id = int(display_id)
-
-        perm = -1 if self.perm_id is None else int(self.perm_id)
-        return coords.tolist() + [display_id, self.score, self.cls, self.idx, perm, int(self.track_id)]
-
-
 
 class BOTSORT(BYTETracker):
     """
@@ -254,10 +171,7 @@ class BOTSORT(BYTETracker):
         The class is designed to work with the YOLOv8 object detection model and supports ReID only if enabled via args.
     """
 
-    N_INIT_FRAMES = 15
-    N_VOTE_INIT = 5
-
-    def __init__(self, args, frame_rate=15):
+    def __init__(self, args, frame_rate=30):
         """
         Initialize YOLOv8 object with ReID module and GMC algorithm.
 
@@ -274,60 +188,11 @@ class BOTSORT(BYTETracker):
         # ReID module
         self.proximity_thresh = args.proximity_thresh
         self.appearance_thresh = args.appearance_thresh
-        
-        self.encoder = None
-        self.used_perm_ids = set()
-        self.permanent_tracks = {}
-        self.MAX_FISH = 9
-        self.stable_frames = getattr(args, "stable_frames", 8)   ##可调参
-        self.min_votes = getattr(args, "min_votes", 4)           ##可调参
-        self.takeover_hits_margin = getattr(args, "takeover_hits_margin", 5)
 
-        if getattr(args, "with_reid", False):
-            weights = getattr(args, "reid_weights", None)
-            if weights:
-                spec = importlib.util.find_spec("reid.extract_embeddings")
-                if spec is None:
-                    LOGGER.warning("ReID module not found; continuing without ReID support.")
-                else:
-                    from reid.extract_embeddings import ReIDEncoder
-
-                    device = getattr(args, "reid_device", "cuda")
-                    try:
-                        self.encoder = ReIDEncoder(weights, device=device)
-                        LOGGER.info(f"Loaded ReIDEncoder from {weights} on {device}")
-                    except Exception as e:
-                        LOGGER.warning(f"Failed to load ReID weights {weights}: {e}")
-            else:
-                LOGGER.warning("with_reid is enabled but no reid_weights provided; disabling ReID.")
-
-        # if args.with_reid:
-        #     # Haven't supported BoT-SORT(reid) yet
-        #     self.encoder = None
+        if args.with_reid:
+            # Haven't supported BoT-SORT(reid) yet
+            self.encoder = None
         self.gmc = GMC(method=args.gmc_method)
-    
-    def update(self, results, img=None):
-        """
-        Run one tracking step (standard BYTETracker) and return the active tracks.
-        Notes:
-        - display_id will follow BOTrack.result fallback (perm_id > fish_label+1 > track_id) if not explicitly assigned.
-        """
-        if img is not None:
-            self.img_h, self.img_w = img.shape[:2]
-
-        # 让 BYTETracker 完成标准的关联、卡尔曼预测等内部更新
-        super().update(results, img)
-
-        # 重新组装输出
-        outputs = []
-        for track in self.tracked_stracks:
-            if track.is_activated:
-                outputs.append(track.result)
-
-        if len(outputs) == 0:
-            # 返回 10 列：x1,y1,x2,y2,display_id,score,cls,idx,perm_id,track_id
-            return np.zeros((0, 10), dtype=float)
-        return np.asarray(outputs, dtype=float)
 
     def get_kalmanfilter(self):
         """Returns an instance of KalmanFilterXYWH for predicting and updating object states in the tracking process."""
@@ -337,53 +202,21 @@ class BOTSORT(BYTETracker):
         """Initialize object tracks using detection bounding boxes, scores, class labels, and optional ReID features."""
         if len(dets) == 0:
             return []
-        # if self.args.with_reid and self.encoder is not None:
-        #     features_keep = self.encoder.inference(img, dets)
-        #     return [BOTrack(xyxy, s, c, f) for (xyxy, s, c, f) in zip(dets, scores, cls, features_keep)]  # detections
-        # else:
-        #     return [BOTrack(xyxy, s, c) for (xyxy, s, c) in zip(dets, scores, cls)]  # detections
-        features_keep, reid_labels, reid_confs = None, None, None
-        if self.encoder is not None and img is not None:
-            # dets are xywh(+idx); convert to xyxy for cropping
-            xyxy = xywh2xyxy(np.asarray(dets)[:, :4])
-            try:
-                features_keep, reid_labels, reid_confs = self.encoder.encode_and_classify(img, xyxy)
-            except AttributeError:
-                # Fallback for encoders without encode_and_classify
-                features_keep = self.encoder(img, xyxy)
-                try:
-                    reid_labels, reid_confs = self.encoder.predict_labels(img, xyxy)
-                except Exception:
-                    reid_labels, reid_confs = None, None
-            except Exception as e:
-                LOGGER.warning(f"ReID feature extraction failed: {e}")
-
-        tracks = []
-        for i, (xywh, s, c) in enumerate(zip(dets, scores, cls)):
-            feat = features_keep[i] if features_keep is not None and len(features_keep) > i else None
-            label = reid_labels[i] if reid_labels is not None and len(reid_labels) > i else c
-            conf = reid_confs[i] if reid_confs is not None and len(reid_confs) > i else None
-            track = BOTrack(xywh, s, label, feat=feat, reid_conf=conf)
-            if reid_labels is not None and len(reid_labels) > i:
-                track.add_label_vote(reid_labels[i])
-            tracks.append(track)
-        return tracks
+        if self.args.with_reid and self.encoder is not None:
+            features_keep = self.encoder.inference(img, dets)
+            return [BOTrack(xyxy, s, c, f) for (xyxy, s, c, f) in zip(dets, scores, cls, features_keep)]  # detections
+        else:
+            return [BOTrack(xyxy, s, c) for (xyxy, s, c) in zip(dets, scores, cls)]  # detections
 
     def get_dists(self, tracks, detections):
-        #"""Calculates distances between tracks and detections using IoU and optionally ReID embeddings."""
-        """
-        仅使用原生的 IoU + ReID 距离（无 S2、无 S3），体现 S1+S4 的消融设定。
-        """
+        """Calculates distances between tracks and detections using IoU and optionally ReID embeddings."""
         dists = matching.iou_distance(tracks, detections)
         dists_mask = dists > self.proximity_thresh
 
-        #if self.args.fuse_score:
-        if getattr(self.args, "fuse_score", False):
+        if self.args.fuse_score:
             dists = matching.fuse_score(dists, detections)
 
-        #if self.args.with_reid and self.encoder is not None:
-        use_reid = getattr(self.args, "with_reid", False) and self.encoder is not None
-        if use_reid and len(tracks) > 0 and len(detections) > 0:
+        if self.args.with_reid and self.encoder is not None:
             emb_dists = matching.embedding_distance(tracks, detections) / 2.0
             emb_dists[emb_dists > self.appearance_thresh] = 1.0
             emb_dists[dists_mask] = 1.0
@@ -398,22 +231,3 @@ class BOTSORT(BYTETracker):
         """Resets the BOTSORT tracker to its initial state, clearing all tracked objects and internal states."""
         super().reset()
         self.gmc.reset_params()
-        
-        self.used_perm_ids = set()
-        self.permanent_tracks = {}
-
-    def _maybe_lock_ids(self):
-        """Assigns permanent IDs via majority voting during the initial warmup frames."""
-        if self.frame_id > self.N_INIT_FRAMES:
-            return
-
-        for track in self.tracked_stracks:
-            if getattr(track, "id_locked", False):
-                continue
-
-            if len(getattr(track, "cls_history", [])) >= self.N_VOTE_INIT:
-                voted_id = Counter(track.cls_history).most_common(1)[0][0]
-                if 1 <= voted_id <= 9 and voted_id not in self.used_perm_ids:
-                    track.perm_id = int(voted_id)
-                    track.id_locked = True
-                    self.used_perm_ids.add(track.perm_id)

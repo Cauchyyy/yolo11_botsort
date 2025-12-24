@@ -17,7 +17,7 @@ from collections import deque, Counter
 
 EPS = 1e-9
 
-def l2_norm(x: np.ndarray):
+def l2_norm(x: np.ndarray):     ##正则化
     x = np.asarray(x, dtype=np.float32)
     if x.size == 0:
         return x
@@ -28,7 +28,7 @@ def l2_norm(x: np.ndarray):
         n = np.linalg.norm(x, axis=1, keepdims=True) + EPS
         return x / n
 
-def cosine_distance_matrix(a: np.ndarray, b: np.ndarray):
+def cosine_distance_matrix(a: np.ndarray, b: np.ndarray):    #计算余弦距离
     if a is None or b is None or a.size == 0 or b.size == 0:
         return np.empty((0,0), dtype=float)
     a_n = l2_norm(a)
@@ -36,14 +36,14 @@ def cosine_distance_matrix(a: np.ndarray, b: np.ndarray):
     sim = np.dot(a_n, b_n.T)
     return 1.0 - sim  # smaller = more similar
 
-def bbox_center(b):
+def bbox_center(b):  #返回 bbox 的中心坐标 (cx, cy)
     return ((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0)
 
-def center_distance(a,b):
+def center_distance(a,b):  #返回两个 bbox 中心点的欧氏距离
     ax,ay = bbox_center(a); bx,by = bbox_center(b)
     return math.hypot(ax-bx, ay-by)
 
-def bbox_iou(a,b):
+def bbox_iou(a,b):  #计算两个 bbox 的 IoU（交并比）
     x1 = max(a[0], b[0]); y1 = max(a[1], b[1])
     x2 = min(a[2], b[2]); y2 = min(a[3], b[3])
     iw = max(0.0, x2-x1); ih = max(0.0, y2-y1)
@@ -53,7 +53,7 @@ def bbox_iou(a,b):
     union = area_a + area_b - inter + 1e-9
     return inter/union if union>0 else 0.0
 
-class Track:
+class Track:  #单条轨迹的状态与管理）
     def __init__(self, bbox, feat, score, track_id, frame_id, is_temporary=True, tracklet_len=10, vote_history=15):
         self.bbox = [float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])]
         self.score = float(score)
@@ -66,21 +66,21 @@ class Track:
         self.is_temporary = bool(is_temporary)
 
         # embedding storages
-        self.feat_long = l2_norm(feat) if feat is not None and feat.size else None  # EMA/long-term
-        self.tracklet = deque(maxlen=tracklet_len)  # recent embeddings
+        self.feat_long = l2_norm(feat) if feat is not None and feat.size else None  # EMA/long-term 长期 EMA embedding（用于稳定长期相似度）
+        self.tracklet = deque(maxlen=tracklet_len)  # recent embeddings  #最近 N 帧 embedding 的 deque（用于短期平均）
         if feat is not None and feat.size:
             self.tracklet.append(l2_norm(feat))
         self.tracklet_len = tracklet_len
 
         # label voting (if matched to classifier predictions)
-        self.fish_label = -1
+        self.fish_label = -1  #若轨迹被归入某类别（或特定个体标签），保存在这里
         self.label_votes = deque(maxlen=vote_history)
         self.label_conf = deque(maxlen=vote_history)
 
         # simple motion velocity (pixel/frame)
         self.vx = 0.0; self.vy = 0.0
 
-    def update_on_match(self, bbox, feat, score, frame_id, ema_momentum=0.06):
+    def update_on_match(self, bbox, feat, score, frame_id, ema_momentum=0.06):  #当检测与某轨迹匹配时，用新信息更新轨迹
         old_cx, old_cy = bbox_center(self.bbox)
         new_cx, new_cy = bbox_center(bbox)
         self.vx = new_cx - old_cx
@@ -111,7 +111,7 @@ class Track:
         avg = np.mean(arr, axis=0)
         return l2_norm(avg)
 
-    def add_label_vote(self, label, conf):
+    def add_label_vote(self, label, conf):  #将新的 classifier 投票加入 label_votes 与 label_conf，并用 Counter 更新 fish_label 为出现频次最高的标签（多数表决）。
         if label is None or int(label) < 0:
             return
         self.label_votes.append(int(label))

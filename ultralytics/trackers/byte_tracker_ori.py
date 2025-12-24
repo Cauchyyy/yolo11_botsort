@@ -342,17 +342,9 @@ class BYTETracker:
             det = detections[idet]
             if track.state == TrackState.Tracked:
                 track.update(det, self.frame_id)
-                ##add#####################
-                if hasattr(track, "add_label_vote") and det.cls is not None:
-                    track.add_label_vote(det.cls)
-                ##########################
                 activated_stracks.append(track)
             else:
                 track.re_activate(det, self.frame_id, new_id=False)
-                ###########################################
-                if hasattr(track, "add_label_vote") and det.cls is not None:
-                    track.add_label_vote(det.cls)
-                #################################################
                 refind_stracks.append(track)
         # Step 3: Second association, with low score detection boxes association the untrack to the low score detections
         detections_second = self.init_track(dets_second, scores_second, cls_second, img)
@@ -365,17 +357,9 @@ class BYTETracker:
             det = detections_second[idet]
             if track.state == TrackState.Tracked:
                 track.update(det, self.frame_id)
-                #######################################################
-                if hasattr(track, "add_label_vote") and det.cls is not None:
-                    track.add_label_vote(det.cls)
-                #######################################################
                 activated_stracks.append(track)
             else:
                 track.re_activate(det, self.frame_id, new_id=False)
-                ############################################################
-                if hasattr(track, "add_label_vote") and det.cls is not None:
-                    track.add_label_vote(det.cls)
-                ########################################################
                 refind_stracks.append(track)
 
         for it in u_track:
@@ -388,13 +372,7 @@ class BYTETracker:
         dists = self.get_dists(unconfirmed, detections)
         matches, u_unconfirmed, u_detection = matching.linear_assignment(dists, thresh=0.7)
         for itracked, idet in matches:
-            #unconfirmed[itracked].update(detections[idet], self.frame_id)
-            ##################################################################
-            det = detections[idet]
-            unconfirmed[itracked].update(det, self.frame_id)
-            if hasattr(unconfirmed[itracked], "add_label_vote") and det.cls is not None:
-                unconfirmed[itracked].add_label_vote(det.cls)
-            #############################################################  
+            unconfirmed[itracked].update(detections[idet], self.frame_id)
             activated_stracks.append(unconfirmed[itracked])
         for it in u_unconfirmed:
             track = unconfirmed[it]

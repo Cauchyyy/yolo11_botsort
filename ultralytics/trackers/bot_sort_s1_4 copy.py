@@ -214,11 +214,15 @@ class BOTrack(STrack):
         """返回跟踪结果，优先使用每帧分配好的 display_id，并附带原始 track_id。"""
         coords = self.xyxy if self.angle is None else self.xywha
 
-        # 优先使用 BOTSORT 在当前帧分配好的 display_id（若存在）
+        # 优先使用 BOTSORT 在当前帧分配好的 display_id，保证一帧内鱼号唯一
         display_id = getattr(self, "display_id", None)
         if display_id is None:
-            # S1-only: no per-fish display assignment; fall back to unique track_id
+            # 回退策略：perm_id > fish_label+1 > track_id
             display_id = int(self.track_id)
+            if self.perm_id is not None:
+                display_id = int(self.perm_id)
+            elif self.fish_label is not None and self.fish_label >= 0:
+                display_id = int(self.fish_label) + 1
         else:
             display_id = int(display_id)
 
@@ -308,9 +312,10 @@ class BOTSORT(BYTETracker):
     
     def update(self, results, img=None):
         """
-        Run one tracking step (standard BYTETracker) and return the active tracks.
-        Notes:
-        - display_id will follow BOTrack.result fallback (perm_id > fish_label+1 > track_id) if not explicitly assigned.
+        Run one tracking step, then assign per-frame unique display IDs:
+        1) perm_id 第一优先；
+        2) 每个 fish_label 至多一条轨迹用 fish_label+1 作为显示 ID；
+        3) 其他轨迹回退使用自身唯一的 track_id。
         """
         if img is not None:
             self.img_h, self.img_w = img.shape[:2]
@@ -318,7 +323,11 @@ class BOTSORT(BYTETracker):
         # 让 BYTETracker 完成标准的关联、卡尔曼预测等内部更新
         super().update(results, img)
 
-        # 重新组装输出
+        # 先更新永久代表轨迹（S4），再做本帧的 display_id 分配（S5）
+        self._update_permanent_tracks()
+        self._assign_display_ids()
+
+        # 使用更新后的 display_id 重新组装输出
         outputs = []
         for track in self.tracked_stracks:
             if track.is_activated:
@@ -417,3 +426,182 @@ class BOTSORT(BYTETracker):
                     track.perm_id = int(voted_id)
                     track.id_locked = True
                     self.used_perm_ids.add(track.perm_id)
+
+    def _assign_display_ids(self):
+        """
+        S5：每帧为所有轨迹分配唯一的显示 ID。
+        规则：
+          1) perm_id（1..9）优先且唯一；
+          2) 对于 perm_id 为空但 fish_label 稳定的临时轨迹，
+             每个 fish_label 至多选一个代表，显示为 fish_label+1；
+          3) 其他轨迹统一回退显示为自身的 track_id（天然唯一）。
+        这样就不会出现“一帧里两个 6 号鱼”的情况。
+        """
+        if not self.tracked_stracks:
+            return
+
+        # 先清空之前的 display_id
+        for t in self.tracked_stracks:
+            if hasattr(t, "display_id"):
+                t.display_id = None
+
+        used_ids = set()
+
+        # 标记本帧是否已经有 perm_id 或稳定 fish_label 候选
+        has_perm = False
+
+        # 1) perm_id 第一优先，占用 1..9 中的号码
+        for t in self.tracked_stracks:
+            perm = getattr(t, "perm_id", None)
+            if perm is None or perm <= 0:
+                continue
+            has_perm = True
+            did = int(perm)
+            if did in used_ids:
+                continue
+            t.display_id = did
+            used_ids.add(did)
+
+        # 2) 为没有 perm_id、但 fish_label 稳定的临时轨迹，挑选代表
+        candidates_by_fish = {k: [] for k in range(self.MAX_FISH)}  # 0..8
+        has_stable_candidate = False
+        for t in self.tracked_stracks:
+            if getattr(t, "display_id", None) is not None:
+                continue
+
+            fish_label = getattr(t, "fish_label", None)
+            if fish_label is None or fish_label < 0:
+                continue
+
+            k = int(fish_label)
+            if not (0 <= k < self.MAX_FISH):
+                continue
+
+            label_votes = getattr(t, "label_votes", None)
+            try:
+                support = Counter(label_votes).get(fish_label, 0) if label_votes is not None else 0
+            except Exception:
+                support = 0
+
+            hits = getattr(t, "hits", 0)
+            conf = getattr(t, "reid_conf", 0.0) or 0.0
+            det_score = getattr(t, "score", 0.0) or 0.0
+
+            if hits < self.stable_frames or support < self.min_votes:
+                continue
+
+            has_stable_candidate = True
+            score = (hits, support, conf, det_score)
+            candidates_by_fish[k].append((score, t))
+
+        # ---- 纯 warmup 阶段：既没有 perm_id，也没有任何稳定 fish_label 候选 ----
+        # 在这个阶段，并且帧号不超过 N_INIT_FRAMES，直接用 track_id 做显示 ID（1..9 等），
+        # 这样前几帧不会出现 10~18 这种“跳号”，同时也保证一帧内不重复。
+        if not has_perm and not has_stable_candidate and getattr(self, "frame_id", 0) <= getattr(self, "N_INIT_FRAMES", 0):
+            for t in self.tracked_stracks:
+                t.display_id = int(t.track_id)
+            return
+
+        # 每条鱼最多挑一个代表显示为 fish_id = fish_label+1
+        for k, cand_list in candidates_by_fish.items():
+            fish_id = k + 1
+            if fish_id in used_ids:
+                continue
+            if not cand_list:
+                continue
+
+            cand_list.sort(key=lambda x: x[0], reverse=True)
+            best_track = cand_list[0][1]
+            best_track.display_id = fish_id
+            used_ids.add(fish_id)
+
+        # 3) 其余轨迹统一回退到基于 track_id 的唯一 ID，必要时加偏移避免和 1..9 冲突
+        for t in self.tracked_stracks:
+            if getattr(t, "display_id", None) is None:
+                base = int(t.track_id)
+                did = base
+                while did in used_ids:
+                    did += self.MAX_FISH
+                t.display_id = did
+                used_ids.add(did)
+
+    def _update_permanent_tracks(self):
+        """
+        S4（非保守版）：
+        - 对满足稳定条件（hits >= stable_frames，投票支持度 >= min_votes）的轨迹，
+          使用 fish_label+1 作为候选 perm_id。
+        - 如果该 perm_id 当前还没有代表，则直接升格为正式轨迹。
+        - 如果已有代表 existing：
+            * 若 existing 已经不是 Tracked 状态，或者太久未更新
+              （frame_id - existing.end_frame > max_time_lost），
+              或者当前 track 的 hits 更多，则由当前 track 接管 perm_id，
+              旧代表降级为临时轨迹。
+        这一版会在同一条鱼出现更稳定的新轨迹时允许“接管”，
+        而不是像保守版那样永远不抢 perm_id。
+        """
+        for track in self.tracked_stracks:
+            # 必须有 fish_label，且为有效标签
+            if not hasattr(track, "fish_label"):
+                continue
+            if track.fish_label is None or track.fish_label < 0:
+                continue
+
+            # 统计当前 fish_label 在投票中的支持度
+            support = 0
+            if hasattr(track, "label_votes"):
+                try:
+                    ctr = Counter(track.label_votes)
+                    support = ctr.get(track.fish_label, 0)
+                except Exception:
+                    # 兜底，防止 label_votes 不是 deque 时报错
+                    try:
+                        support = list(track.label_votes).count(track.fish_label)
+                    except Exception:
+                        support = 0
+
+            # 轨迹还不够稳定：命中次数不足或投票支持度不足，跳过
+            if track.hits < self.stable_frames or support < self.min_votes:
+                continue
+
+            # perm_id = fish_label + 1，限定在 [1, MAX_FISH] 范围内
+            candidate_perm_id = int(track.fish_label) + 1
+            if candidate_perm_id < 1 or candidate_perm_id > self.MAX_FISH:
+                continue
+
+            existing = self.permanent_tracks.get(candidate_perm_id)
+
+            # 如果当前轨迹已经是“正式轨迹”，只需保证字典里有它即可
+            if not track.is_temporary:
+                if existing is None or existing is track:
+                    self.permanent_tracks[candidate_perm_id] = track
+                    self.used_perm_ids.add(candidate_perm_id)
+                continue
+
+            # 如果该 perm_id 还没有代表，直接升格当前轨迹
+            if existing is None:
+                track.promote_to_permanent(candidate_perm_id)
+                self.permanent_tracks[candidate_perm_id] = track
+                self.used_perm_ids.add(candidate_perm_id)
+                continue
+
+            # 判断旧代表是否应该被接管
+            too_old = (
+                (self.frame_id - existing.end_frame) > self.max_time_lost
+                if hasattr(self, "max_time_lost") else False
+            )
+
+            margin = getattr(self, "takeover_hits_margin", 5)        ####
+            old_hits = getattr(existing, "hits", 0)
+            new_hits = getattr(track, "hits", 0)
+            better_hits = new_hits >= (old_hits + margin)
+
+            # 条件：旧代表状态不好 / 过期 / 新轨迹 hits 更高（含 margin），就让新轨迹接管 perm_id
+            if existing.state != TrackState.Tracked or too_old or better_hits:
+                # 旧代表降级为临时轨迹，收回 perm_id
+                existing.is_temporary = True
+                existing.perm_id = None
+
+                # 当前轨迹升格为该 perm_id 的正式代表
+                track.promote_to_permanent(candidate_perm_id)
+                self.permanent_tracks[candidate_perm_id] = track
+                self.used_perm_ids.add(candidate_perm_id)

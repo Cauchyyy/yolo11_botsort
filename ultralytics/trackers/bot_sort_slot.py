@@ -81,13 +81,14 @@ class BOTrack(STrack):
 
         self.reid_conf = reid_conf
         self.cls_history = deque()
-        self.perm_id = None
-        self.id_locked = False
         self.label_votes = deque(maxlen=15)
         self.fish_label = -1
-        self.is_temporary = True
         self.hits = 0
-        # 速度记录，仅用于调试（本版本未在关联中使用）
+        # S4: perm_id management
+        self.perm_id = None
+        self.id_locked = False
+        self.is_temporary = True
+        # Speed record
         self.prev_center = None
         self.speed = 0.0
 
@@ -118,6 +119,7 @@ class BOTrack(STrack):
         super().activate(kalman_filter, frame_id)
         self.hits = 1
         self._update_speed()
+        # New tracks start as temporary without a slot assignment
     ###################################################################
     def re_activate(self, new_track, frame_id, new_id=False):
         """Reactivates a track with updated features and optionally assigns a new ID."""
@@ -157,7 +159,7 @@ class BOTrack(STrack):
             self.fish_label = int(lbl)
 
     def promote_to_permanent(self, perm_id: int):
-        """Mark this track as a permanent track with a fixed perm_id."""
+        """Mark this track as a permanent representative with a fixed perm_id and eval_id."""
         self.is_temporary = False
         self.perm_id = int(perm_id)
         self.id_locked = True
@@ -211,19 +213,30 @@ class BOTrack(STrack):
 
     @property
     def result(self):
-        """返回跟踪结果，优先使用每帧分配好的 display_id，并附带原始 track_id。"""
+        """Return tracking result for downstream visualization/export."""
         coords = self.xyxy if self.angle is None else self.xywha
 
-        # 优先使用 BOTSORT 在当前帧分配好的 display_id（若存在）
+        # display_id: per-frame unique ID for visualization
         display_id = getattr(self, "display_id", None)
         if display_id is None:
-            # S1-only: no per-fish display assignment; fall back to unique track_id
             display_id = int(self.track_id)
+            if self.perm_id is not None:
+                display_id = int(self.perm_id)
+            elif self.fish_label is not None and self.fish_label >= 0:
+                display_id = int(self.fish_label) + 1
         else:
             display_id = int(display_id)
 
         perm = -1 if self.perm_id is None else int(self.perm_id)
-        return coords.tolist() + [display_id, self.score, self.cls, self.idx, perm, int(self.track_id)]
+
+        return coords.tolist() + [
+            display_id,
+            self.score,
+            self.cls,
+            self.idx,
+            perm,
+            int(self.track_id),
+        ]
 
 
 
@@ -276,12 +289,19 @@ class BOTSORT(BYTETracker):
         self.appearance_thresh = args.appearance_thresh
         
         self.encoder = None
-        self.used_perm_ids = set()
-        self.permanent_tracks = {}
+
+        # S1/S4: fish label voting + permanent ID management
         self.MAX_FISH = 9
-        self.stable_frames = getattr(args, "stable_frames", 8)   ##可调参
-        self.min_votes = getattr(args, "min_votes", 4)           ##可调参
-        self.takeover_hits_margin = getattr(args, "takeover_hits_margin", 5)
+        self.stable_frames = getattr(args, "stable_frames", 8)
+        self.min_votes = getattr(args, "min_votes", 4)
+        self.slot_hold_frames = getattr(args, "slot_hold_frames", 20)
+        self.slot_lock_frames = getattr(args, "slot_lock_frames", 6)
+        self.takeover_hits_margin = getattr(args, "takeover_hits_margin", 3)
+        self.takeover_votes_margin = getattr(args, "takeover_votes_margin", 2)
+        self.takeover_iou_gate = getattr(args, "takeover_iou_gate", 0.10)
+        self.slot_owner = {i: None for i in range(1, self.MAX_FISH + 1)}
+        self.slot_last_seen = {i: -1 for i in range(1, self.MAX_FISH + 1)}
+        self.slot_lock_until = {i: -1 for i in range(1, self.MAX_FISH + 1)}
 
         if getattr(args, "with_reid", False):
             weights = getattr(args, "reid_weights", None)
@@ -307,25 +327,26 @@ class BOTSORT(BYTETracker):
         self.gmc = GMC(method=args.gmc_method)
     
     def update(self, results, img=None):
-        """
-        Run one tracking step (standard BYTETracker) and return the active tracks.
-        Notes:
-        - display_id will follow BOTrack.result fallback (perm_id > fish_label+1 > track_id) if not explicitly assigned.
+        """Run one tracking step, update slot assignments, and set per-frame display IDs.
+
+        Returns:
+            np.ndarray: (N, 10) shaped array with columns
+            [x1, y1, x2, y2, display_id, score, cls, idx, perm_id, track_id].
         """
         if img is not None:
             self.img_h, self.img_w = img.shape[:2]
 
-        # 让 BYTETracker 完成标准的关联、卡尔曼预测等内部更新
         super().update(results, img)
+        self._update_slots()
+        self._assign_display_ids()
 
-        # 重新组装输出
         outputs = []
         for track in self.tracked_stracks:
             if track.is_activated:
                 outputs.append(track.result)
 
         if len(outputs) == 0:
-            # 返回 10 列：x1,y1,x2,y2,display_id,score,cls,idx,perm_id,track_id
+            # x1,y1,x2,y2,display_id,score,cls,idx,perm_id,track_id
             return np.zeros((0, 10), dtype=float)
         return np.asarray(outputs, dtype=float)
 
@@ -399,21 +420,179 @@ class BOTSORT(BYTETracker):
         super().reset()
         self.gmc.reset_params()
         
-        self.used_perm_ids = set()
-        self.permanent_tracks = {}
+        self.slot_owner = {i: None for i in range(1, self.MAX_FISH + 1)}
+        self.slot_last_seen = {i: -1 for i in range(1, self.MAX_FISH + 1)}
+        self.slot_lock_until = {i: -1 for i in range(1, self.MAX_FISH + 1)}
 
-    def _maybe_lock_ids(self):
-        """Assigns permanent IDs via majority voting during the initial warmup frames."""
-        if self.frame_id > self.N_INIT_FRAMES:
-            return
-
+    def _update_slots(self):
+        """S4 Slot Manager: bind stable tracks to slots (perm_id 1..MAX_FISH)."""
         for track in self.tracked_stracks:
-            if getattr(track, "id_locked", False):
+            if not track.is_activated:
                 continue
 
-            if len(getattr(track, "cls_history", [])) >= self.N_VOTE_INIT:
-                voted_id = Counter(track.cls_history).most_common(1)[0][0]
-                if 1 <= voted_id <= 9 and voted_id not in self.used_perm_ids:
-                    track.perm_id = int(voted_id)
-                    track.id_locked = True
-                    self.used_perm_ids.add(track.perm_id)
+            fish_label = getattr(track, "fish_label", None)
+            label_votes = getattr(track, "label_votes", None)
+            if fish_label is None or fish_label < 0 or not label_votes:
+                continue
+
+            # vote support for this label
+            try:
+                support_new = Counter(label_votes).get(fish_label, 0)
+            except Exception:
+                try:
+                    support_new = list(label_votes).count(fish_label)
+                except Exception:
+                    support_new = 0
+
+            if track.hits < self.stable_frames or support_new < self.min_votes:
+                continue
+
+            candidate_slot = int(fish_label) + 1
+            if not (1 <= candidate_slot <= self.MAX_FISH):
+                continue
+
+            existing = self.slot_owner.get(candidate_slot)
+            support_old = 0
+            old_hits = 0
+            if existing is not None:
+                try:
+                    support_old = Counter(getattr(existing, "label_votes", [])).get(existing.fish_label, 0)
+                except Exception:
+                    try:
+                        support_old = list(getattr(existing, "label_votes", [])).count(existing.fish_label)
+                    except Exception:
+                        support_old = 0
+                old_hits = getattr(existing, "hits", 0)
+
+            # takeover gating
+            locked = self.frame_id < self.slot_lock_until.get(candidate_slot, -1)
+            too_old = (self.frame_id - self.slot_last_seen.get(candidate_slot, -1)) > self.slot_hold_frames
+            existing_bad = existing is None or existing.state != TrackState.Tracked or too_old
+            strong_takeover = False
+            if existing is not None and existing is not track:
+                iou_val = matching.iou_distance([track], [existing])
+                iou_score = 1.0 - iou_val[0, 0] if iou_val.size else 0.0
+                strong_takeover = (
+                    track.hits >= old_hits + self.takeover_hits_margin
+                    and support_new >= support_old + self.takeover_votes_margin
+                    and iou_score >= self.takeover_iou_gate
+                )
+
+            can_takeover = existing is None or existing_bad or strong_takeover
+            if locked and existing is not None and existing.state == TrackState.Tracked and not too_old:
+                can_takeover = False
+
+            if can_takeover:
+                if existing is not None and existing is not track:
+                    existing.perm_id = None
+                    existing.is_temporary = True
+                track.promote_to_permanent(candidate_slot)
+                self.slot_owner[candidate_slot] = track
+                self.slot_last_seen[candidate_slot] = self.frame_id
+                self.slot_lock_until[candidate_slot] = self.frame_id + self.slot_lock_frames
+                continue
+
+            if existing is track:
+                self.slot_last_seen[candidate_slot] = self.frame_id
+
+
+    def _assign_display_ids(self):
+        """Assign per-frame unique display IDs with perm_id priority and fish_label representatives."""
+        if not self.tracked_stracks:
+            return
+
+        for t in self.tracked_stracks:
+            if hasattr(t, "display_id"):
+                t.display_id = None
+
+        used_ids = set()
+        candidates_by_fish = {k: [] for k in range(self.MAX_FISH)}
+
+        # 1) perm_id has highest priority
+        for t in self.tracked_stracks:
+            perm = getattr(t, "perm_id", None)
+            if perm is None or perm <= 0:
+                continue
+            did = int(perm)
+            if did in used_ids:
+                continue
+            t.display_id = did
+            used_ids.add(did)
+
+        # 2) stable fish_label representatives (one per label) if display not set
+        for t in self.tracked_stracks:
+            if getattr(t, "display_id", None) is not None:
+                continue
+            fish_label = getattr(t, "fish_label", None)
+            if fish_label is None or fish_label < 0:
+                continue
+            k = int(fish_label)
+            if not (0 <= k < self.MAX_FISH):
+                continue
+
+            label_votes = getattr(t, "label_votes", None)
+            try:
+                support = Counter(label_votes).get(fish_label, 0) if label_votes is not None else 0
+            except Exception:
+                try:
+                    support = list(label_votes).count(fish_label)
+                except Exception:
+                    support = 0
+
+            hits = getattr(t, "hits", 0)
+            conf = getattr(t, "reid_conf", 0.0) or 0.0
+            det_score = getattr(t, "score", 0.0) or 0.0
+
+            if hits < self.stable_frames or support < self.min_votes:
+                continue
+
+            score = (hits, support, conf, det_score)
+            candidates_by_fish[k].append((score, t))
+
+        for k, cand_list in candidates_by_fish.items():
+            fish_id = k + 1
+            if fish_id in used_ids:
+                continue
+            if not cand_list:
+                continue
+
+            cand_list.sort(key=lambda x: x[0], reverse=True)
+            best_track = cand_list[0][1]
+            best_track.display_id = fish_id
+            used_ids.add(fish_id)
+
+        # 3) fallback to unique track-based IDs avoiding conflicts with 1..MAX_FISH
+        for t in self.tracked_stracks:
+            if getattr(t, "display_id", None) is not None:
+                continue
+            base = int(t.track_id) + self.MAX_FISH
+            did = base
+            while did in used_ids:
+                did += self.MAX_FISH
+            t.display_id = did
+            used_ids.add(did)
+
+        # Safety de-duplication: if any display_id repeats, keep the highest-score track and reassign others
+        best_by_id = {}
+        for t in self.tracked_stracks:
+            did = getattr(t, "display_id", None)
+            if did is None:
+                continue
+            sc = float(getattr(t, "score", 0.0) or 0.0)
+            if did not in best_by_id or sc > best_by_id[did][0]:
+                best_by_id[did] = (sc, t)
+
+        used_ids.clear()
+        for did, (_, t_best) in best_by_id.items():
+            t_best.display_id = did
+            used_ids.add(did)
+
+        for t in self.tracked_stracks:
+            did = getattr(t, "display_id", None)
+            if did in used_ids and best_by_id.get(did, (None, None))[1] is not t:
+                # reassign to an unused fallback range
+                new_id = int(t.track_id) + 2 * self.MAX_FISH
+                while new_id in used_ids:
+                    new_id += self.MAX_FISH
+                t.display_id = new_id
+                used_ids.add(new_id)
